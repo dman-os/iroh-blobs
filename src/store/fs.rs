@@ -102,15 +102,15 @@ use bytes::Bytes;
 use delete_set::{BaoFilePart, ProtectHandle};
 use entity_manager::{EntityManagerState, SpawnArg};
 use entry_state::{DataLocation, OutboardLocation};
-use import::{ImportEntry, ImportSource};
+use import::{ImportEntry, ImportSource, TempPath};
 use irpc::{channel::mpsc, RpcMessage};
-use meta::list_blobs;
+use meta::{list_blobs, raw_outboard_size};
 use n0_error::{Result, StdResultExt};
 use n0_future::{future::yield_now, io};
 use nested_enum_utils::enum_conversions;
 use range_collections::range_set::RangeSetRange;
 use tokio::task::{JoinError, JoinSet};
-use tracing::{error, instrument, trace, warn};
+use tracing::{error, instrument, trace, warn, Span};
 
 use crate::{
     api::{
@@ -118,7 +118,8 @@ use crate::{
             self, bitfield::is_validated, BatchMsg, BatchResponse, Bitfield, Command,
             CreateTempTagMsg, ExportBaoMsg, ExportBaoRequest, ExportPathMsg, ExportPathRequest,
             ExportRangesItem, ExportRangesMsg, ExportRangesRequest, HashSpecific, ImportBaoMsg,
-            ImportBaoRequest, ObserveMsg, Scope,
+            ImportBaoRequest, ObserveMsg, Scope, AddVirtualWithOutboardMsg,
+            AddVirtualWithOutboardRequest,
         },
         ApiClient,
     },
@@ -133,6 +134,7 @@ use crate::{
         },
         gc::run_gc,
         util::{BaoTreeSender, FixedSize, MemOrFile, ValueOrPoisioned},
+        virtual_blob::{DynReadBytesAt, VirtualProviders},
         IROH_BLOCK_SIZE,
     },
     util::{
@@ -150,7 +152,7 @@ mod meta;
 pub mod options;
 pub(crate) mod util;
 use entry_state::EntryState;
-use import::{import_byte_stream, import_bytes, import_path, ImportEntryMsg};
+use import::{build_outboard, import_byte_stream, import_bytes, import_path, ImportEntryMsg};
 use options::Options;
 use tracing::Instrument;
 
@@ -160,7 +162,7 @@ use crate::{
         blobs::{AddProgressItem, ExportMode, ExportProgressItem},
         Store,
     },
-    HashAndFormat,
+    BlobFormat, HashAndFormat,
 };
 
 /// Maximum number of external paths we track per blob.
@@ -185,7 +187,22 @@ fn temp_name() -> String {
 pub(crate) enum InternalCommand {
     Dump(meta::Dump),
     FinishImport(ImportEntryMsg),
+    FinishBuildOutboard(FinishBuildOutboardMsg),
     ClearScope(ClearScope),
+}
+
+/// Internal command carrying the result of a `BuildOutboard` operation: the
+/// computed outboard (in memory or as a temp file) and size for a virtual
+/// entry, plus the channels to finish registration.
+#[derive(Debug)]
+pub(crate) struct FinishBuildOutboardMsg {
+    pub hash: Hash,
+    pub scope: Scope,
+    pub format: BlobFormat,
+    pub outboard: MemOrFile<Bytes, TempPath>,
+    pub size: u64,
+    pub tx: mpsc::Sender<AddProgressItem>,
+    pub span: tracing::Span,
 }
 
 #[derive(Debug)]
@@ -198,6 +215,7 @@ impl InternalCommand {
         match self {
             Self::Dump(_) => tracing::Span::current(),
             Self::ClearScope(_) => tracing::Span::current(),
+            Self::FinishBuildOutboard(cmd) => cmd.span.clone(),
             Self::FinishImport(cmd) => cmd
                 .parent_span_opt()
                 .cloned()
@@ -217,6 +235,8 @@ struct TaskContext {
     pub internal_cmd_tx: tokio::sync::mpsc::Sender<InternalCommand>,
     /// Handle to protect files from deletion.
     pub protect: ProtectHandle,
+    /// Live providers for virtual blobs, keyed by provider name.
+    pub virtuals: VirtualProviders,
 }
 
 impl TaskContext {
@@ -377,6 +397,7 @@ impl SyncEntityApi for HashContext {
     fn current_size(&self) -> io::Result<u64> {
         match self.state.borrow().deref() {
             BaoFileStorage::Complete(mem) => Ok(mem.size()),
+            BaoFileStorage::Virtual(mem) => Ok(mem.size()),
             BaoFileStorage::PartialMem(mem) => Ok(mem.current_size()),
             BaoFileStorage::Partial(file) => file.current_size(),
             BaoFileStorage::Poisoned => Err(io::Error::other("poisoned storage")),
@@ -390,6 +411,7 @@ impl SyncEntityApi for HashContext {
     fn bitfield(&self) -> io::Result<Bitfield> {
         match self.state.borrow().deref() {
             BaoFileStorage::Complete(mem) => Ok(mem.bitfield()),
+            BaoFileStorage::Virtual(mem) => Ok(mem.bitfield()),
             BaoFileStorage::PartialMem(mem) => Ok(mem.bitfield().clone()),
             BaoFileStorage::Partial(file) => Ok(file.bitfield().clone()),
             BaoFileStorage::Poisoned => Err(io::Error::other("poisoned storage")),
@@ -555,6 +577,18 @@ impl Actor {
                 trace!("{cmd:?}");
                 self.spawn(import_byte_stream(cmd, self.context()));
             }
+            Command::BuildOutboard(cmd) => {
+                trace!("{cmd:?}");
+                self.spawn(build_outboard(cmd, self.context()));
+            }
+            Command::AddVirtual(cmd) => {
+                trace!("{cmd:?}");
+                self.db().send(cmd.into()).await.ok();
+            }
+            Command::AddVirtualWithOutboard(cmd) => {
+                trace!("{cmd:?}");
+                self.spawn(add_virtual_with_outboard(cmd, self.context()));
+            }
             Command::ImportPath(cmd) => {
                 trace!("{cmd:?}");
                 self.spawn(import_path(cmd, self.context()));
@@ -612,6 +646,28 @@ impl Actor {
                     (tt, cmd).spawn(&mut self.handles, &mut self.tasks).await;
                 }
             }
+            InternalCommand::FinishBuildOutboard(cmd) => {
+                trace!("{cmd:?}");
+                let mut tt = self.temp_tags.create(
+                    cmd.scope,
+                    HashAndFormat {
+                        hash: cmd.hash,
+                        format: cmd.format,
+                    },
+                );
+                let ctx = self.context.clone();
+                let res = finish_build_outboard_impl(&ctx, cmd.hash, cmd.outboard, cmd.size).await;
+                let item = match res {
+                    Ok(()) => {
+                        if cmd.tx.is_rpc() {
+                            tt.leak();
+                        }
+                        AddProgressItem::Done(tt)
+                    }
+                    Err(cause) => AddProgressItem::Error(cause),
+                };
+                cmd.tx.send(item).await.ok();
+            }
         }
     }
 
@@ -665,7 +721,7 @@ impl Actor {
         fs_commands_rx: tokio::sync::mpsc::Receiver<InternalCommand>,
         fs_commands_tx: tokio::sync::mpsc::Sender<InternalCommand>,
         options: Arc<Options>,
-    ) -> Result<Self> {
+    ) -> Result<(Self, VirtualProviders)> {
         trace!(
             "creating data directory: {}",
             options.path.data_path.display()
@@ -688,23 +744,28 @@ impl Actor {
         // directory. Anything in it is left over from imports that did not complete,
         // for example because the process was killed.
         remove_all_files(&options.path.temp_path);
+        let virtuals = VirtualProviders::new();
         let slot_context = Arc::new(TaskContext {
             options: options.clone(),
             db: meta::Db::new(db_send),
             internal_cmd_tx: fs_commands_tx,
             protect,
+            virtuals: virtuals.clone(),
         });
         tokio::spawn(db_actor.run());
-        Ok(Self {
-            context: slot_context.clone(),
-            cmd_rx,
-            fs_cmd_rx: fs_commands_rx,
-            tasks: JoinSet::new(),
-            handles: EntityManagerState::new(slot_context, 1024, 32, 32, 2),
-            temp_tags: Default::default(),
-            idle_waiters: Vec::new(),
-            _rt: RtWrapper(None),
-        })
+        Ok((
+            Self {
+                context: slot_context.clone(),
+                cmd_rx,
+                fs_cmd_rx: fs_commands_rx,
+                tasks: JoinSet::new(),
+                handles: EntityManagerState::new(slot_context, 1024, 32, 32, 2),
+                temp_tags: Default::default(),
+                idle_waiters: Vec::new(),
+                _rt: RtWrapper(None),
+            },
+            virtuals,
+        ))
     }
 }
 
@@ -999,6 +1060,61 @@ impl EntityApi for HashContext {
     async fn export_bao(&self, mut cmd: ExportBaoMsg) {
         trace!("{cmd:?}");
         self.load().await;
+        // A virtual entry has its outboard in the store but no data; the data
+        // is served on demand by the provider named in the entry. An entry
+        // whose provider is not registered (or whose provider has no data for
+        // this hash) is served as not found.
+        let is_virtual = matches!(self.state.borrow().deref(), BaoFileStorage::Virtual(_));
+        if is_virtual {
+            let provider_name = {
+                let state = self.state.borrow();
+                match state.deref() {
+                    BaoFileStorage::Virtual(v) => v.provider.clone(),
+                    _ => unreachable!("checked above"),
+                }
+            };
+            let Some(provider) = self.global.virtuals.get(&provider_name) else {
+                cmd.tx
+                    .send(
+                        bao_tree::io::EncodeError::Io(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            "no provider registered for virtual entry",
+                        ))
+                        .into(),
+                    )
+                    .await
+                    .ok();
+                return;
+            };
+            let Some(source) = provider.reader_for(&self.id) else {
+                cmd.tx
+                    .send(
+                        bao_tree::io::EncodeError::Io(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            "provider has no data for virtual entry",
+                        ))
+                        .into(),
+                    )
+                    .await
+                    .ok();
+                return;
+            };
+            let outboard = match self.outboard() {
+                Ok(o) => o,
+                Err(cause) => {
+                    cmd.tx
+                        .send(bao_tree::io::EncodeError::Io(cause).into())
+                        .await
+                        .ok();
+                    return;
+                }
+            };
+            let tx = BaoTreeSender::new(&mut cmd.tx);
+            traverse_ranges_validated(DynReadBytesAt(source), outboard, &cmd.inner.ranges, tx)
+                .await
+                .ok();
+            return;
+        }
         if let Err(cause) = export_bao_impl(self, cmd.inner, &mut cmd.tx).await {
             // if the entry is in state NonExisting, this will be an io error with
             // kind NotFound. So we must not wrap this somehow but pass it on directly.
@@ -1058,6 +1174,130 @@ impl EntityApi for HashContext {
             false
         });
     }
+}
+
+/// Store a virtual entry: outboard only, no data. The data is served later by
+/// the provider named in the entry, registered in
+/// [`crate::store::virtual_blob::VirtualProviders`].
+async fn finish_build_outboard_impl(
+    ctx: &TaskContext,
+    hash: Hash,
+    outboard: MemOrFile<Bytes, TempPath>,
+    size: u64,
+) -> io::Result<()> {
+    let outboard_location = match outboard {
+        MemOrFile::Mem(bytes) if bytes.is_empty() => OutboardLocation::NotNeeded,
+        MemOrFile::Mem(bytes) => OutboardLocation::Inline(bytes),
+        MemOrFile::File(path) => {
+            // Mirror `finish_import_impl`: keep the outboard as a file in the
+            // canonical location rather than inlining it, so large virtual
+            // outboards don't bloat the database.
+            let target = ctx.options.path.outboard_path(&hash);
+            trace!(
+                "moving temp outboard file to owned outboard location: {} -> {}",
+                path.as_ref().display(),
+                target.display()
+            );
+            path.persist(&target)?;
+            OutboardLocation::Owned
+        }
+    };
+    let state = EntryState::Virtual {
+        outboard_location,
+        size,
+        provider: String::new(),
+    };
+    ctx.db.set(hash, state).await
+}
+
+/// Install a caller-supplied bao outboard as a virtual entry.
+///
+/// This is the store-side half for getters that received a blob's verified
+/// content without importing it (see `Remote::fetch_bao_to`). Validates the
+/// outboard against `size`, rejects entries that already hold stored or
+/// partial data, then decides inline-vs-file placement like
+/// [`finish_build_outboard_impl`] and stores the virtual entry.
+#[instrument(skip_all, fields(hash = %cmd.inner.hash.fmt_short()))]
+async fn add_virtual_with_outboard(cmd: AddVirtualWithOutboardMsg, ctx: Arc<TaskContext>) {
+    let AddVirtualWithOutboardMsg {
+        inner:
+            AddVirtualWithOutboardRequest {
+                hash,
+                size,
+                outboard,
+                provider,
+            },
+        tx,
+        ..
+    } = cmd;
+    // The outboard must match the size: one 64-byte hash pair per non-root
+    // tree node, and nothing at all for a single-chunk blob.
+    if outboard.len() as u64 != raw_outboard_size(size) {
+        tx.send(Err(crate::api::Error::io(
+            io::ErrorKind::InvalidInput,
+            "outboard length does not match blob size",
+        )))
+        .await
+        .ok();
+        return;
+    }
+    // Stored data takes precedence over a virtual source. Check before any
+    // file work so we never touch an existing entry's outboard file. The check
+    // is advisory; `set` below is unconditional, mirroring
+    // `finish_build_outboard_impl`.
+    let snapshot = match ctx.db.snapshot(Span::current()).await {
+        Ok(snapshot) => snapshot,
+        Err(cause) => {
+            tx.send(Err(crate::api::Error::from(cause))).await.ok();
+            return;
+        }
+    };
+    let existing = match snapshot.blobs.get(hash) {
+        Ok(existing) => existing,
+        Err(cause) => {
+            tx.send(Err(crate::api::Error::other(cause))).await.ok();
+            return;
+        }
+    };
+    if let Some(state) = existing {
+        if matches!(state.value(), EntryState::Complete { .. } | EntryState::Partial { .. }) {
+            tx.send(Err(crate::api::Error::io(
+                io::ErrorKind::InvalidInput,
+                "entry already exists as stored data",
+            )))
+            .await
+            .ok();
+            return;
+        }
+    }
+    drop(snapshot);
+    let outboard_location = if outboard.is_empty() {
+        OutboardLocation::NotNeeded
+    } else if ctx.options.is_inlined_outboard(outboard.len() as u64) {
+        OutboardLocation::Inline(outboard)
+    } else {
+        // Mirror `finish_build_outboard_impl`: keep large outboards as a file
+        // in the canonical location rather than inlining them.
+        let target = ctx.options.path.outboard_path(&hash);
+        if let Err(cause) = std::fs::write(&target, &outboard) {
+            error!(
+                "failed to write outboard file {} for virtual entry: {cause}",
+                target.display()
+            );
+            tx.send(Err(crate::api::Error::from(cause))).await.ok();
+            return;
+        }
+        OutboardLocation::Owned
+    };
+    let state = EntryState::Virtual {
+        outboard_location,
+        size,
+        provider,
+    };
+    match ctx.db.set(hash, state).await {
+        Ok(()) => tx.send(Ok(())).await.ok(),
+        Err(cause) => tx.send(Err(crate::api::Error::from(cause))).await.ok(),
+    };
 }
 
 async fn finish_import_impl(ctx: &HashContext, import_data: ImportEntry) -> io::Result<()> {
@@ -1290,6 +1530,12 @@ async fn export_path_impl(
                 "cannot export partial entry",
             ));
         }
+        Some(EntryState::Virtual { .. }) => {
+            return Err(api::Error::io(
+                io::ErrorKind::InvalidInput,
+                "cannot export a virtual entry to a path; it has no stored data",
+            ));
+        }
         None => {
             return Err(api::Error::io(io::ErrorKind::NotFound, "no entry found"));
         }
@@ -1444,7 +1690,22 @@ impl FsStore {
     }
 
     /// Load or create a new store with custom options, returning an additional sender for file store specific commands.
+    /// Load or create a new store with custom options.
     pub async fn load_with_opts(db_path: PathBuf, options: Options) -> Result<FsStore> {
+        Ok(Self::load_with_virtuals(db_path, options).await?.0)
+    }
+
+    /// Load or create a new store with custom options, returning both the store
+    /// and a [`VirtualProviders`] registry shared with the store actor.
+    ///
+    /// The registry is used to register live providers for virtual blobs (see
+    /// [`crate::store::virtual_blob::VirtualProviders`]). It is the "add"
+    /// half of the two-layer virtual blob API; pair it with
+    /// [`crate::api::blobs::Blobs::build_outboard`].
+    pub async fn load_with_virtuals(
+        db_path: PathBuf,
+        options: Options,
+    ) -> Result<(FsStore, VirtualProviders)> {
         static THREAD_NR: AtomicU64 = AtomicU64::new(0);
         let mut builder = tokio::runtime::Builder::new_multi_thread();
         builder
@@ -1478,7 +1739,7 @@ impl FsStore {
         let gc_sender = commands_tx.downgrade();
         let (fs_commands_tx, fs_commands_rx) = tokio::sync::mpsc::channel(100);
         let gc_config = options.gc.clone();
-        let mut actor = handle
+        let (mut actor, virtuals) = handle
             .spawn(Actor::new(
                 db_path,
                 commands_rx,
@@ -1498,8 +1759,9 @@ impl FsStore {
         if let Some(config) = gc_config {
             handle.spawn(run_gc(gc_sender, config));
         }
-        Ok(store)
+        Ok((store, virtuals))
     }
+
 }
 
 /// A file based store.
@@ -1584,6 +1846,7 @@ pub mod tests {
     use walkdir::WalkDir;
 
     use super::*;
+    use crate::store::virtual_blob::{DynVirtualSource, Provider};
     use crate::{
         api::blobs::{AddPathOptions, Bitfield, ImportMode},
         store::{
@@ -1611,7 +1874,7 @@ pub mod tests {
         let dir = tempfile::tempdir()?;
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(32);
         let (fs_tx, fs_rx) = tokio::sync::mpsc::channel(32);
-        let mut actor = Actor::new(
+        let (mut actor, _virtuals) = Actor::new(
             dir.path().join("blobs.db"),
             cmd_rx,
             fs_rx,
@@ -1700,7 +1963,173 @@ pub mod tests {
         }
         Bytes::from(res)
     }
+    /// A provider that serves a fixed set of bytes for any hash.
+    #[derive(Clone)]
+    struct TestProvider {
+        data: Bytes,
+    }
 
+    impl TestProvider {
+        fn new(data: Bytes) -> Self {
+            Self { data }
+        }
+    }
+
+    impl Provider for TestProvider {
+        fn reader_for(&self, _hash: &Hash) -> Option<DynVirtualSource> {
+            Some(Arc::new(self.data.clone()))
+        }
+    }
+
+    /// A virtual blob on the fs store: build the outboard from a stream
+    /// without storing data, associate a provider, register it, and serve. The
+    /// served bytes must be byte-identical to a normally-stored blob and
+    /// round-trip through `import_bao`.
+    #[tokio::test]
+    async fn virtual_blob_roundtrip_fs() -> TestResult<()> {
+        use std::sync::Arc;
+
+        let testdir = tempfile::tempdir()?;
+        let (store, virtuals) = FsStore::load_with_virtuals(
+            testdir.path().join("blobs.db"),
+            Options::new(testdir.path()),
+        )
+        .await?;
+        let data = test_data(1024 * 64);
+
+        // Build the outboard from a stream of the data, without storing it.
+        let stream = stream::iter(vec![Ok::<_, std::io::Error>(data.clone())]);
+        let tt = store.build_outboard(stream).await.temp_tag().await?;
+        let hash = tt.hash();
+
+        // An entry with no provider declared is served as not found.
+        let err: crate::api::Error = store
+            .export_bao(hash, ChunkRanges::all())
+            .bao_to_vec()
+            .await
+            .unwrap_err()
+            .into();
+        assert!(
+            matches!(err, crate::api::Error::Io(e) if e.kind() == io::ErrorKind::NotFound),
+            "virtual fs entry without a provider must serve as not found"
+        );
+
+        // Declaring a provider that is not registered is still not found.
+        store.add_virtual(hash, "test-provider").await?;
+        let err: crate::api::Error = store
+            .export_bao(hash, ChunkRanges::all())
+            .bao_to_vec()
+            .await
+            .unwrap_err()
+            .into();
+        assert!(
+            matches!(err, crate::api::Error::Io(e) if e.kind() == io::ErrorKind::NotFound),
+            "virtual fs entry with an unregistered provider must serve as not found"
+        );
+
+        // Register the provider and serve.
+        virtuals.register("test-provider", Arc::new(TestProvider::new(data.clone())))?;
+        let exported_virtual = store
+            .export_bao(hash, ChunkRanges::all())
+            .bao_to_vec()
+            .await?;
+
+        // Compare against a normal stored blob of identical content.
+        let store2 = FsStore::load(testdir.path().join("store2")).await?;
+        let tt2 = store2.add_bytes(data.clone()).temp_tag().await?;
+        assert_eq!(tt2.hash(), hash, "hashes must match for identical content");
+        let exported_stored = store2
+            .export_bao(hash, ChunkRanges::all())
+            .bao_to_vec()
+            .await?;
+        assert_eq!(
+            exported_virtual, exported_stored,
+            "virtual fs export must be byte-identical to stored export"
+        );
+
+        // Round-trip through import_bao back to the data.
+        let store3 = FsStore::load(testdir.path().join("store3")).await?;
+        store3
+            .import_bao_bytes(hash, ChunkRanges::all(), exported_virtual.clone())
+            .await?;
+        let got = store3.get_bytes(hash).await?;
+        assert_eq!(got, data, "round-tripped data must match the original");
+
+        Ok(())
+    }
+
+    /// A virtual blob whose outboard exceeds the inline threshold is stored as
+    /// an outboard file (mirroring normal large blobs), not inlined into the
+    /// database.
+    #[tokio::test]
+    async fn virtual_blob_large_outboard_fs() -> TestResult<()> {
+        use std::sync::Arc;
+
+        let testdir = tempfile::tempdir()?;
+        let options = Options::new(testdir.path());
+        let (store, virtuals) =
+            FsStore::load_with_virtuals(testdir.path().join("blobs.db"), options.clone()).await?;
+        // 8 MiB of data yields an outboard above the default 16 KiB inline
+        // threshold (see `INTERESTING_SIZES`), so it must go to a file.
+        let data = test_data(1024 * 1024 * 8);
+        let stream = stream::iter(vec![Ok::<_, std::io::Error>(data.clone())]);
+        let tt = store.build_outboard(stream).await.temp_tag().await?;
+        let hash = tt.hash();
+
+        // The outboard must live at the canonical outboard file location.
+        let outboard_path = options.path.outboard_path(&hash);
+        assert!(
+            outboard_path.exists(),
+            "large virtual outboard must be stored as a file at {}",
+            outboard_path.display()
+        );
+
+        // Serving reads the outboard file and the provider data.
+        virtuals.register("test-provider", Arc::new(TestProvider::new(data.clone())))?;
+        store.add_virtual(hash, "test-provider").await?;
+        let exported = store
+            .export_bao(hash, ChunkRanges::all())
+            .bao_to_vec()
+            .await?;
+        assert!(!exported.is_empty());
+
+        // And the export must round-trip to the original data.
+        let store2 = FsStore::load(testdir.path().join("store2")).await?;
+        store2
+            .import_bao_bytes(hash, ChunkRanges::all(), exported)
+            .await?;
+        let got = store2.get_bytes(hash).await?;
+        assert_eq!(got, data, "round-tripped data must match the original");
+        Ok(())
+    }
+
+    /// A virtual fs entry reports as `Complete` for status/has purposes (it is
+    /// servable), even though it has no stored data.
+    #[tokio::test]
+    async fn virtual_entry_status_fs() -> TestResult<()> {
+        use crate::api::blobs::BlobStatus;
+
+        let testdir = tempfile::tempdir()?;
+        let (store, _virtuals) = FsStore::load_with_virtuals(
+            testdir.path().join("blobs.db"),
+            Options::new(testdir.path()),
+        )
+        .await?;
+        let data = test_data(1024 * 64);
+        let stream = stream::iter(vec![Ok::<_, std::io::Error>(data.clone())]);
+        let tt = store.build_outboard(stream).await.temp_tag().await?;
+        let hash = tt.hash();
+
+        assert!(
+            store.has(hash).await?,
+            "virtual entry should be reported as present"
+        );
+        match store.status(hash).await? {
+            BlobStatus::Complete { size } => assert_eq!(size, data.len() as u64),
+            other => panic!("expected Complete for virtual entry, got {other:?}"),
+        }
+        Ok(())
+    }
     // import data via import_bytes, check that we can observe it and that it is complete
     #[tokio::test]
     #[traced_test]
